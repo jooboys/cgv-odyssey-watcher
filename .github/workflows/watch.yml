@@ -1,0 +1,49 @@
+name: CGV 예매일 감시
+
+on:
+  schedule:
+    # 10분마다 잡을 시작하고, 각 잡은 11분 동안 1분 간격으로 확인한다.
+    # (GitHub 크론 최소 간격은 5분이라, 1분 감시는 잡 안에서 루프로 처리)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:        # 버튼으로 수동 실행
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # 직전 잡이 남긴 "이미 알고 있는 날짜" 목록을 가져온다.
+      - name: 이전 상태 복원
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: cgv-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cgv-state-
+
+      - name: 감시 실행
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CGV_SITE_NO: "0074"
+          CGV_SITE_NAME: "CGV 왕십리"
+          CGV_MOV_NO: "30001323"
+          CGV_MOV_NAME: "오디세이"
+          CGV_LOOP_INTERVAL: "60"
+          CGV_LOOP_DURATION_MIN: "11"
+        run: python check.py
+
+      - name: 상태 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: cgv-state-${{ github.run_id }}-${{ github.run_attempt }}
