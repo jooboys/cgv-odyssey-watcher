@@ -6,6 +6,11 @@ on:
     # (GitHub 크론 최소 간격은 5분이라, 1분 감시는 잡 안에서 루프로 처리)
     - cron: "*/10 * * * *"
   workflow_dispatch:        # 버튼으로 수동 실행
+    inputs:
+      test_alert:
+        description: "알림 모양 테스트 (실제 감시 대신 샘플 알림 1건만 보냄)"
+        type: boolean
+        default: false
 
 jobs:
   watch:
@@ -39,6 +44,8 @@ jobs:
           CGV_MOV_NAME: "오디세이"
           CGV_LOOP_INTERVAL: "60"
           CGV_LOOP_DURATION_MIN: "11"
+          CGV_TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
+          CGV_APP_OPEN_URL: ""
         run: python check.py
 
       - name: 상태 저장

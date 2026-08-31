@@ -41,6 +41,14 @@ HEADERS = {
 BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 MOVIE_URL = f"https://cgv.co.kr/cnm/cgvChart/movieChart/{MOV_NO}"
 
+# 알림에 붙는 인라인 버튼. APP_OPEN_URL 을 넣으면 "앱으로 열기" 버튼이 하나 더 붙는다.
+APP_OPEN_URL = os.environ.get("CGV_APP_OPEN_URL", "").strip()
+
+ALERT_BUTTONS = [[{"text": "🎟 지금 예매하기", "url": BOOKING_URL}],
+                 [{"text": "🎬 영화 정보", "url": MOVIE_URL}]]
+if APP_OPEN_URL:
+    ALERT_BUTTONS.insert(0, [{"text": "📱 CGV 앱으로 열기", "url": APP_OPEN_URL}])
+
 
 def log(msg):
     print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
@@ -116,7 +124,7 @@ def fmt_showtimes(rows):
     return "\n".join(lines)
 
 
-def send_telegram(text, silent=False):
+def send_telegram(text, silent=False, buttons=None):
     if not BOT_TOKEN or not CHAT_ID:
         log("텔레그램 토큰/챗ID가 없어 전송 생략. 메시지 내용:\n" + text)
         return False
@@ -127,6 +135,9 @@ def send_telegram(text, silent=False):
         "disable_web_page_preview": True,
         "disable_notification": silent,
     }
+    # 텔레그램 인라인 버튼은 http/https 링크만 허용한다. (cgv:// 같은 앱 스킴은 거부됨)
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
     for attempt in range(3):
         try:
             r = requests.post(url, json=payload, timeout=20)
@@ -209,9 +220,8 @@ def run_once(session):
             f"🎬 {MOV_NAME} · {SITE_NAME}\n"
             f"🔔 새 예매일이 열렸습니다! ({len(new_dates)}일)\n\n"
             + "\n\n".join(blocks)
-            + f"\n\n▶ 예매: {BOOKING_URL}\n▶ 영화정보: {MOVIE_URL}"
         )
-        if not send_telegram(msg):
+        if not send_telegram(msg, buttons=ALERT_BUTTONS):
             # 전송 실패 시 상태를 갱신하지 않아 다음 회차에 재시도된다.
             log("전송 실패 — 상태 미갱신, 다음 회차에 재시도")
             return 1
@@ -223,8 +233,29 @@ def run_once(session):
     return 0
 
 
+def send_test_alert(session):
+    """실제 알림이 어떻게 생겼는지 확인용으로 한 번 보낸다. (감시 상태는 건드리지 않음)"""
+    dates = fetch_open_dates(session)
+    if not dates:
+        log("열린 날짜가 없어 테스트 알림을 보낼 수 없습니다.")
+        return 1
+    ymd = dates[-1]
+    msg = (
+        f"🧪 [테스트] 실제 알림은 이렇게 옵니다\n\n"
+        f"🎬 {MOV_NAME} · {SITE_NAME}\n"
+        f"🔔 새 예매일이 열렸습니다! (1일)\n\n"
+        f"📅 {fmt_date(ymd)}\n{fmt_showtimes(fetch_showtimes(session, ymd))}"
+    )
+    ok = send_telegram(msg, buttons=ALERT_BUTTONS)
+    log("테스트 알림 전송 " + ("성공" if ok else "실패"))
+    return 0 if ok else 1
+
+
 def main():
     session = requests.Session(impersonate="chrome")
+
+    if os.environ.get("CGV_TEST_ALERT") == "1":
+        return send_test_alert(session)
 
     interval = int(os.environ.get("CGV_LOOP_INTERVAL", "0"))
     duration_min = float(os.environ.get("CGV_LOOP_DURATION_MIN", "0"))
