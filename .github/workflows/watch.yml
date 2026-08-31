@@ -38,8 +38,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CGV_SITE_NO: "0074"
-          CGV_SITE_NAME: "CGV 왕십리"
+          # 감시할 극장들. "극장코드:표시이름" 을 쉼표로 나열한다.
+          CGV_SITES: "0074:CGV 왕십리,0013:CGV 용산아이파크몰"
           CGV_MOV_NO: "30001323"
           CGV_MOV_NAME: "오디세이"
           CGV_LOOP_INTERVAL: "60"

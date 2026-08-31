@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CGV 신규 예매일 감시 -> 텔레그램 알림.
+"""CGV 신규 예매일 감시 -> 텔레그램 알림. (여러 극장 동시 감시)
 
 CGV는 Cloudflare 봇 차단을 쓰기 때문에 일반 HTTP 클라이언트(requests/curl)는 403이 난다.
 curl_cffi 로 크롬의 TLS 지문을 흉내내면 통과한다. (헤드리스 브라우저 불필요)
@@ -18,10 +18,24 @@ WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 BASE = "https://cgv.co.kr/api/v1/booking"
 CO_CD = "A420"
 
-SITE_NO = os.environ.get("CGV_SITE_NO", "0074")
-SITE_NAME = os.environ.get("CGV_SITE_NAME", "CGV 왕십리")
 MOV_NO = os.environ.get("CGV_MOV_NO", "30001323")
 MOV_NAME = os.environ.get("CGV_MOV_NAME", "오디세이")
+
+
+def parse_sites(raw):
+    """'0074:CGV 왕십리,0013:CGV 용산아이파크몰' -> [('0074','CGV 왕십리'), ...]"""
+    sites = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        code, _, name = chunk.partition(":")
+        sites.append((code.strip(), name.strip() or code.strip()))
+    return sites
+
+
+SITES = parse_sites(os.environ.get(
+    "CGV_SITES", "0074:CGV 왕십리,0013:CGV 용산아이파크몰"))
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -41,13 +55,12 @@ HEADERS = {
 BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 MOVIE_URL = f"https://cgv.co.kr/cnm/cgvChart/movieChart/{MOV_NO}"
 
-# 알림에 붙는 인라인 버튼. APP_OPEN_URL 을 넣으면 "앱으로 열기" 버튼이 하나 더 붙는다.
-APP_OPEN_URL = os.environ.get("CGV_APP_OPEN_URL", "").strip()
-
+# 알림에 붙는 인라인 버튼. 텔레그램은 http(s) 링크만 버튼에 허용한다.
+# (CGV는 앱 딥링크를 제공하지 않아 앱으로 바로 여는 버튼은 만들 수 없다.)
 ALERT_BUTTONS = [[{"text": "🎟 지금 예매하기", "url": BOOKING_URL}],
                  [{"text": "🎬 영화 정보", "url": MOVIE_URL}]]
-if APP_OPEN_URL:
-    ALERT_BUTTONS.insert(0, [{"text": "📱 CGV 앱으로 열기", "url": APP_OPEN_URL}])
+
+FAIL_ALERT_AFTER = 10  # 이 횟수만큼 연속 실패하면 한 번 경고
 
 
 def log(msg):
@@ -74,21 +87,21 @@ def api_get(session, path, params, tries=3):
     raise RuntimeError(f"{path} 실패: {last}")
 
 
-def fetch_open_dates(session):
+def fetch_open_dates(session, site_no):
     """이 극장에서 이 영화의 '예매 가능한 날짜' 목록 (YYYYMMDD)."""
     data = api_get(session, "searchSiteScnscYmdListByMov",
-                   {"coCd": CO_CD, "siteNo": SITE_NO, "movNo": MOV_NO})
+                   {"coCd": CO_CD, "siteNo": site_no, "movNo": MOV_NO})
     return sorted({row["scnYmd"] for row in data if row.get("scnYmd")})
 
 
-def fetch_showtimes(session, ymd):
+def fetch_showtimes(session, site_no, ymd):
     """특정 날짜의 상영 회차 목록."""
     try:
         return api_get(session, "searchSchByMov",
-                       {"coCd": CO_CD, "siteNo": SITE_NO, "scnYmd": ymd,
+                       {"coCd": CO_CD, "siteNo": site_no, "scnYmd": ymd,
                         "movNo": MOV_NO, "rtctlScopCd": "08"}, tries=2)
     except Exception as e:
-        log(f"  상영시간표 조회 실패({ymd}): {e}")
+        log(f"  상영시간표 조회 실패({site_no}/{ymd}): {e}")
         return []
 
 
@@ -124,6 +137,32 @@ def fmt_showtimes(rows):
     return "\n".join(lines)
 
 
+TELEGRAM_MAX = 4096
+SAFE_LEN = 3800  # 여유를 두고 자른다
+
+
+def build_messages(header, blocks):
+    """헤더 + 날짜별 블록을 텔레그램 길이 제한에 맞게 1개 이상의 메시지로 나눈다.
+
+    새 날짜가 한꺼번에 여러 개 열리고 상영관이 많으면 4096자를 넘길 수 있는데,
+    그러면 전송이 통째로 실패해 알림을 놓친다. 그래서 미리 쪼갠다.
+    """
+    msgs, cur = [], []
+    cur_len = len(header)
+    for b in blocks:
+        # 블록 하나가 이미 너무 길면 그 블록만 잘라낸다.
+        if len(b) > SAFE_LEN - len(header):
+            b = b[: SAFE_LEN - len(header) - 40].rstrip() + "\n     … (이하 생략, 앱에서 확인)"
+        if cur and cur_len + len(b) + 2 > SAFE_LEN:
+            msgs.append(header + "\n\n" + "\n\n".join(cur))
+            cur, cur_len = [], len(header)
+        cur.append(b)
+        cur_len += len(b) + 2
+    if cur:
+        msgs.append(header + "\n\n" + "\n\n".join(cur))
+    return msgs
+
+
 def send_telegram(text, silent=False, buttons=None):
     if not BOT_TOKEN or not CHAT_ID:
         log("텔레그램 토큰/챗ID가 없어 전송 생략. 메시지 내용:\n" + text)
@@ -135,7 +174,6 @@ def send_telegram(text, silent=False, buttons=None):
         "disable_web_page_preview": True,
         "disable_notification": silent,
     }
-    # 텔레그램 인라인 버튼은 http/https 링크만 허용한다. (cgv:// 같은 앱 스킴은 거부됨)
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
     for attempt in range(3):
@@ -153,12 +191,24 @@ def send_telegram(text, silent=False, buttons=None):
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except FileNotFoundError:
-        return {}
+        return {"sites": {}}
     except Exception as e:
         log(f"상태파일 손상({e}) — 새로 시작")
-        return {}
+        return {"sites": {}}
+
+    # 예전 단일극장 형식(state["known_dates"])을 극장별 형식으로 옮긴다.
+    if "known_dates" in state and "sites" not in state:
+        first = SITES[0][0] if SITES else "0074"
+        state = {"sites": {first: {
+            "known_dates": state["known_dates"],
+            "consecutive_failures": state.get("consecutive_failures", 0),
+            "failure_alerted": state.get("failure_alerted", False),
+        }}}
+        log(f"이전 상태를 극장 {first} 기준으로 이전했습니다.")
+    state.setdefault("sites", {})
+    return state
 
 
 def save_state(state):
@@ -168,91 +218,98 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def run_once(session):
-    state = load_state()
-    known = set(state.get("known_dates", []))
-    fails = state.get("consecutive_failures", 0)
-
+def check_site(session, site_no, site_name, st):
+    """극장 하나를 확인한다. st 는 이 극장의 상태 dict (제자리에서 갱신)."""
     try:
-        dates = fetch_open_dates(session)
+        dates = fetch_open_dates(session, site_no)
     except Exception as e:
-        fails += 1
-        log(f"조회 실패({fails}회 연속): {e}")
-        # 10회(약 10분) 연속 실패하면 한 번만 경고. 조용히 죽는 것을 막는다.
-        if fails == 10 and not state.get("failure_alerted"):
+        fails = st.get("consecutive_failures", 0) + 1
+        st["consecutive_failures"] = fails
+        log(f"[{site_name}] 조회 실패({fails}회 연속): {e}")
+        if fails == FAIL_ALERT_AFTER and not st.get("failure_alerted"):
             send_telegram(
-                f"⚠️ CGV 감시 오류\n{MOV_NAME} / {SITE_NAME} 조회가 10회 연속 실패했습니다.\n"
-                f"사유: {e}\n\nCGV가 차단 방식을 바꿨을 수 있습니다."
+                f"⚠️ CGV 감시 오류\n{MOV_NAME} / {site_name} 조회가 "
+                f"{FAIL_ALERT_AFTER}회 연속 실패했습니다.\n사유: {e}\n\n"
+                f"CGV가 차단 방식을 바꿨을 수 있습니다."
             )
-            state["failure_alerted"] = True
-        state["consecutive_failures"] = fails
-        save_state(state)
-        return 1
+            st["failure_alerted"] = True
+        return
 
-    if fails >= 10 and state.get("failure_alerted"):
-        send_telegram(f"✅ CGV 감시 정상 복구 ({MOV_NAME} / {SITE_NAME})", silent=True)
-    state["consecutive_failures"] = 0
-    state["failure_alerted"] = False
-    state["last_checked"] = datetime.now(KST).isoformat(timespec="seconds")
+    if st.get("consecutive_failures", 0) >= FAIL_ALERT_AFTER and st.get("failure_alerted"):
+        send_telegram(f"✅ CGV 감시 정상 복구 ({MOV_NAME} / {site_name})", silent=True)
+    st["consecutive_failures"] = 0
+    st["failure_alerted"] = False
 
     # 첫 실행: 지금 열려 있는 날짜를 기준선으로 저장만 하고 알리지 않는다.
-    if "known_dates" not in state:
-        state["known_dates"] = dates
-        save_state(state)
-        log(f"기준선 저장: {len(dates)}일 ({dates[0] if dates else '-'} ~ {dates[-1] if dates else '-'})")
+    if "known_dates" not in st:
+        st["known_dates"] = dates
+        log(f"[{site_name}] 기준선 저장: {len(dates)}일 "
+            f"({dates[0] if dates else '-'} ~ {dates[-1] if dates else '-'})")
         send_telegram(
-            f"👀 감시 시작\n{MOV_NAME} · {SITE_NAME}\n\n"
+            f"👀 감시 시작\n🏛 {site_name}\n🎬 {MOV_NAME}\n\n"
             f"현재 열린 예매일: {len(dates)}일\n"
-            f"{fmt_date(dates[0]) if dates else '-'} ~ {fmt_date(dates[-1]) if dates else '-'}\n\n"
+            f"{fmt_date(dates[0]) if dates else '-'} ~ "
+            f"{fmt_date(dates[-1]) if dates else '-'}\n\n"
             f"새 날짜가 열리면 바로 알려드릴게요.",
             silent=True,
         )
-        return 0
+        return
 
+    known = set(st["known_dates"])
     new_dates = [d for d in dates if d not in known]
 
     if new_dates:
-        log(f"🔔 신규 예매일 {len(new_dates)}개: {', '.join(new_dates)}")
-        blocks = []
-        for ymd in new_dates:
-            blocks.append(f"📅 {fmt_date(ymd)}\n{fmt_showtimes(fetch_showtimes(session, ymd))}")
-        msg = (
-            f"🎬 {MOV_NAME} · {SITE_NAME}\n"
-            f"🔔 새 예매일이 열렸습니다! ({len(new_dates)}일)\n\n"
-            + "\n\n".join(blocks)
-        )
-        if not send_telegram(msg, buttons=ALERT_BUTTONS):
-            # 전송 실패 시 상태를 갱신하지 않아 다음 회차에 재시도된다.
-            log("전송 실패 — 상태 미갱신, 다음 회차에 재시도")
-            return 1
+        log(f"[{site_name}] 🔔 신규 예매일 {len(new_dates)}개: {', '.join(new_dates)}")
+        header = (f"🔔 새 예매일이 열렸습니다! ({len(new_dates)}일)\n"
+                  f"🏛 {site_name}\n🎬 {MOV_NAME}")
+        blocks = [f"📅 {fmt_date(y)}\n{fmt_showtimes(fetch_showtimes(session, site_no, y))}"
+                  for y in new_dates]
+        for msg in build_messages(header, blocks):
+            if not send_telegram(msg, buttons=ALERT_BUTTONS):
+                # 전송 실패 시 기준선을 갱신하지 않아 다음 회차에 재시도된다.
+                log(f"[{site_name}] 전송 실패 — 기준선 미갱신, 다음 회차에 재시도")
+                return
     else:
-        log(f"변화 없음 ({len(dates)}일, 마지막 {dates[-1] if dates else '-'})")
+        log(f"[{site_name}] 변화 없음 ({len(dates)}일, 마지막 {dates[-1] if dates else '-'})")
 
-    state["known_dates"] = dates
+    st["known_dates"] = dates
+
+
+def run_once(session):
+    state = load_state()
+    for site_no, site_name in SITES:
+        st = state["sites"].setdefault(site_no, {})
+        try:
+            check_site(session, site_no, site_name, st)
+        except Exception as e:
+            log(f"[{site_name}] 예상치 못한 오류: {type(e).__name__}: {e}")
+    state["last_checked"] = datetime.now(KST).isoformat(timespec="seconds")
     save_state(state)
     return 0
 
 
 def send_test_alert(session):
-    """실제 알림이 어떻게 생겼는지 확인용으로 한 번 보낸다. (감시 상태는 건드리지 않음)"""
-    dates = fetch_open_dates(session)
-    if not dates:
-        log("열린 날짜가 없어 테스트 알림을 보낼 수 없습니다.")
-        return 1
-    ymd = dates[-1]
-    msg = (
-        f"🧪 [테스트] 실제 알림은 이렇게 옵니다\n\n"
-        f"🎬 {MOV_NAME} · {SITE_NAME}\n"
-        f"🔔 새 예매일이 열렸습니다! (1일)\n\n"
-        f"📅 {fmt_date(ymd)}\n{fmt_showtimes(fetch_showtimes(session, ymd))}"
-    )
-    ok = send_telegram(msg, buttons=ALERT_BUTTONS)
-    log("테스트 알림 전송 " + ("성공" if ok else "실패"))
-    return 0 if ok else 1
+    """실제 알림이 어떻게 생겼는지 확인용. (감시 기준선은 건드리지 않음)"""
+    ok_all = True
+    for site_no, site_name in SITES:
+        dates = fetch_open_dates(session, site_no)
+        if not dates:
+            log(f"[{site_name}] 열린 날짜가 없어 테스트 알림 생략")
+            continue
+        ymd = dates[-1]
+        msg = (f"🧪 [테스트] 실제 알림은 이렇게 옵니다\n\n"
+               f"🔔 새 예매일이 열렸습니다! (1일)\n"
+               f"🏛 {site_name}\n🎬 {MOV_NAME}\n\n"
+               f"📅 {fmt_date(ymd)}\n{fmt_showtimes(fetch_showtimes(session, site_no, ymd))}")
+        ok = send_telegram(msg, buttons=ALERT_BUTTONS)
+        log(f"[{site_name}] 테스트 알림 전송 " + ("성공" if ok else "실패"))
+        ok_all = ok_all and ok
+    return 0 if ok_all else 1
 
 
 def main():
     session = requests.Session(impersonate="chrome")
+    log("감시 극장: " + ", ".join(f"{n}({c})" for c, n in SITES))
 
     if os.environ.get("CGV_TEST_ALERT") == "1":
         return send_test_alert(session)
