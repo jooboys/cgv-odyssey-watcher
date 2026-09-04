@@ -2,9 +2,12 @@ name: CGV 예매일 감시
 
 on:
   schedule:
-    # 10분마다 잡을 시작하고, 각 잡은 11분 동안 1분 간격으로 확인한다.
-    # (GitHub 크론 최소 간격은 5분이라, 1분 감시는 잡 안에서 루프로 처리)
-    - cron: "*/10 * * * *"
+    # GitHub 예약 실행은 우선순위가 낮아 몇 시간씩 밀리거나 통째로 건너뛴다.
+    # 그래서 크론은 "감시를 이어붙이는 방아쇠"로만 쓰고,
+    # 실제 감시는 잡 하나가 340분(약 5시간 40분) 동안 1분 간격 루프로 수행한다.
+    # 아래 concurrency 설정이 잡을 한 번에 하나만 돌리고 다음 잡을 대기시키므로,
+    # 크론이 밀려도 잡이 끝나는 즉시 대기 중이던 잡이 이어받아 감시가 끊기지 않는다.
+    - cron: "*/30 * * * *"
   workflow_dispatch:        # 버튼으로 수동 실행
     inputs:
       test_alert:
@@ -12,10 +15,16 @@ on:
         type: boolean
         default: false
 
+# 감시 잡은 항상 1개만 실행하고, 새로 트리거된 잡은 취소하지 않고 대기시킨다.
+# 테스트 실행은 별도 그룹이라 감시 잡을 기다리지 않고 바로 돈다.
+concurrency:
+  group: cgv-watch-${{ inputs.test_alert && 'test' || 'main' }}
+  cancel-in-progress: false
+
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 16
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +52,7 @@ jobs:
           CGV_MOV_NO: "30001323"
           CGV_MOV_NAME: "오디세이"
           CGV_LOOP_INTERVAL: "60"
-          CGV_LOOP_DURATION_MIN: "11"
+          CGV_LOOP_DURATION_MIN: "340"
           CGV_TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
           CGV_APP_OPEN_URL: ""
         run: python check.py

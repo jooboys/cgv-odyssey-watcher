@@ -328,6 +328,10 @@ def main():
     while True:
         started = time.monotonic()
         n += 1
+        # 몇 시간씩 도는 잡이라 오래된 연결이 끊길 수 있다. 주기적으로 새로 맺는다.
+        if n % 60 == 0:
+            session = requests.Session(impersonate="chrome")
+            log(f"({n}회차) 연결 갱신")
         try:
             run_once(session)
         except Exception as e:  # 루프 자체는 절대 죽지 않게
