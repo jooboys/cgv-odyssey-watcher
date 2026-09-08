@@ -326,9 +326,50 @@ def send_test_alert(session):
     return 0 if ok_all else 1
 
 
+def run_diagnostics():
+    """메시지를 보내지 않고 봇/채팅 상태만 조회한다. (429 원인 좁히기용)
+
+    sendMessage 가 아닌 읽기 전용 API 들이라, 봇 전체가 막힌 건지
+    특정 채팅으로 보내는 것만 막힌 건지 구분할 수 있다.
+    토큰은 절대 출력하지 않는다.
+    """
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    checks = [
+        ("getMe", "/getMe", {}),
+        ("getWebhookInfo", "/getWebhookInfo", {}),
+        ("getChat(대상 채팅)", "/getChat", {"chat_id": CHAT_ID}),
+        ("getChatMemberCount", "/getChatMemberCount", {"chat_id": CHAT_ID}),
+    ]
+    for label, path, params in checks:
+        try:
+            r = requests.get(base + path, params=params, timeout=20)
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if r.status_code == 200 and body.get("ok"):
+                res = body.get("result")
+                if isinstance(res, dict):
+                    keep = {k: v for k, v in res.items()
+                            if k in ("username", "type", "title", "pending_update_count",
+                                     "last_error_message", "last_error_date", "url",
+                                     "can_post_messages", "id")}
+                    log(f"  ✅ {label}: {keep}")
+                else:
+                    log(f"  ✅ {label}: {res}")
+            else:
+                params_out = (body.get("parameters") or {})
+                log(f"  ❌ {label}: HTTP {r.status_code} "
+                    f"{body.get('description', r.text[:120])} {params_out}")
+        except Exception as e:
+            log(f"  ❌ {label}: {type(e).__name__}: {e}")
+    return 0
+
+
 def main():
     session = requests.Session(impersonate="chrome")
     log("감시 극장: " + ", ".join(f"{n}({c})" for c, n in SITES))
+
+    if os.environ.get("CGV_DIAGNOSE") == "1":
+        log("텔레그램 진단 시작 (메시지는 보내지 않습니다)")
+        return run_diagnostics()
 
     if os.environ.get("CGV_TEST_ALERT") == "1":
         return send_test_alert(session)

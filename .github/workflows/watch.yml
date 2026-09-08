@@ -14,11 +14,15 @@ on:
         description: "알림 모양 테스트 (실제 감시 대신 샘플 알림 1건만 보냄)"
         type: boolean
         default: false
+      diagnose:
+        description: "텔레그램 진단 (메시지를 보내지 않고 봇/채팅 상태만 조회)"
+        type: boolean
+        default: false
 
 # 감시 잡은 항상 1개만 실행하고, 새로 트리거된 잡은 취소하지 않고 대기시킨다.
 # 테스트 실행은 별도 그룹이라 감시 잡을 기다리지 않고 바로 돈다.
 concurrency:
-  group: cgv-watch-${{ inputs.test_alert && 'test' || 'main' }}
+  group: cgv-watch-${{ (inputs.test_alert || inputs.diagnose) && 'test' || 'main' }}
   cancel-in-progress: false
 
 jobs:
@@ -54,6 +58,7 @@ jobs:
           CGV_LOOP_INTERVAL: "60"
           CGV_LOOP_DURATION_MIN: "340"
           CGV_TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
+          CGV_DIAGNOSE: ${{ inputs.diagnose && '1' || '0' }}
           CGV_APP_OPEN_URL: ""
         run: python check.py
 
