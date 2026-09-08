@@ -61,6 +61,7 @@ ALERT_BUTTONS = [[{"text": "🎟 지금 예매하기", "url": BOOKING_URL}],
                  [{"text": "🎬 영화 정보", "url": MOVIE_URL}]]
 
 FAIL_ALERT_AFTER = 10  # 이 횟수만큼 연속 실패하면 한 번 경고
+RETRY_AFTER_MAX_WAIT = 120  # 429 때 이 시간까지는 기다렸다 재시도, 넘으면 다음 회차로 미룸
 
 
 def log(msg):
@@ -181,6 +182,21 @@ def send_telegram(text, silent=False, buttons=None):
             r = requests.post(url, json=payload, timeout=20)
             if r.status_code == 200:
                 return True
+            if r.status_code == 429:
+                # 텔레그램 속도 제한. 얼마나 기다려야 하는지 알려준다.
+                try:
+                    wait = int((r.json().get("parameters") or {}).get("retry_after") or 0)
+                except Exception:
+                    wait = 0
+                if wait > RETRY_AFTER_MAX_WAIT:
+                    # 오래 기다려야 하면 이 회차는 포기한다. 기준선을 갱신하지 않으므로
+                    # 바깥 1분 루프가 다음 회차에 자동으로 다시 시도한다.
+                    log(f"텔레그램 속도제한(429) — {wait}초 대기 필요. "
+                        f"이번 회차 포기, 다음 회차에 재시도합니다.")
+                    return False
+                log(f"텔레그램 속도제한(429) — {wait}초 기다린 뒤 재시도")
+                time.sleep(wait + 1)
+                continue
             log(f"텔레그램 전송 실패 HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
             log(f"텔레그램 전송 오류: {type(e).__name__}: {e}")
@@ -264,7 +280,10 @@ def check_site(session, site_no, site_name, st):
                   f"🏛 {site_name}\n🎬 {MOV_NAME}")
         blocks = [f"📅 {fmt_date(y)}\n{fmt_showtimes(fetch_showtimes(session, site_no, y))}"
                   for y in new_dates]
-        for msg in build_messages(header, blocks):
+        msgs = build_messages(header, blocks)
+        for i, msg in enumerate(msgs):
+            if i:
+                time.sleep(1.2)  # 텔레그램 초당 전송 제한 회피
             if not send_telegram(msg, buttons=ALERT_BUTTONS):
                 # 전송 실패 시 기준선을 갱신하지 않아 다음 회차에 재시도된다.
                 log(f"[{site_name}] 전송 실패 — 기준선 미갱신, 다음 회차에 재시도")
